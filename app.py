@@ -18,7 +18,6 @@ import re
 import io
 warnings.filterwarnings('ignore')
 
-
 # ==========================================================
 # FUNCIONES AUXILIARES GLOBALES
 # ==========================================================
@@ -116,53 +115,31 @@ def geolocate_ip(ip):
         '200.1': 'Brasil',
         '186.': 'Colombia',
         '200.32': 'Uruguay',
-        '200.3': 'Paraguay',
-        '192.168.': 'Red Local',
-        '203.0.113.': 'Ejemplo',
-        '198.51.100.': 'Ejemplo'
+        '200.3': 'Paraguay'
     }
     for prefix, country in ip_ranges.items():
         if ip.startswith(prefix):
             return country
     return 'Otros Países'
 
-def preprocess_data(df, file_type, log_format):
-    """Preprocesa los datos según el tipo de archivo y formato"""
-    try:
-        if file_type == "JSON":
-            # Formato original para JSON
-            df['fecha'] = pd.to_datetime(df['fecha'], format='%d-%m-%Y %I:%M:%S%p', errors='coerce')
-        elif log_format == "Log Apache/NGINX":
-            # Formato para logs Apache
-            df['fecha'] = pd.to_datetime(df['fecha'], format='%d/%b/%Y:%H:%M:%S %z', errors='coerce')
-        else:
-            # Intentar formato genérico
-            df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
-        
-        # Eliminar filas con fechas inválidas
-        initial_count = len(df)
-        df = df.dropna(subset=['fecha'])
-        if len(df) < initial_count:
-            st.warning(f"Se eliminaron {initial_count - len(df)} registros con fechas inválidas")
-        
-        # Resto del procesamiento
-        df['navegador'] = df['user_agent'].apply(extract_browser)
-        df['sistema_operativo'] = df['user_agent'].apply(extract_os)
-        df['dispositivo'] = df['user_agent'].apply(extract_device)
-        static_extensions = ['.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.ico', '.svg', '.woff', '.ttf']
-        df['es_estatico'] = df['url'].str.contains('|'.join(static_extensions), case=False, na=False)
-        df['pais'] = df['IP'].apply(geolocate_ip)
-        df['hora'] = df['fecha'].dt.hour
-        df['dia_semana'] = df['fecha'].dt.day_name()
-        df['mes'] = df['fecha'].dt.month_name()
-        
-        return df
-        
-    except Exception as e:
-        st.error(f"Error en preprocesamiento: {str(e)}")
-        return df
+def preprocess_data(df):
+    df['fecha'] = pd.to_datetime(df['fecha'], format='%d-%m-%Y %I:%M:%S%p', errors='coerce')
+    # Si falla el formato anterior, intentar con formato de log estándar
+    if df['fecha'].isna().any():
+        df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
+    
+    df['navegador'] = df['user_agent'].apply(extract_browser)
+    df['sistema_operativo'] = df['user_agent'].apply(extract_os)
+    df['dispositivo'] = df['user_agent'].apply(extract_device)
+    static_extensions = ['.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.ico', '.svg', '.woff', '.ttf']
+    df['es_estatico'] = df['url'].str.contains('|'.join(static_extensions), case=False, na=False)
+    df['pais'] = df['IP'].apply(geolocate_ip)
+    df['hora'] = df['fecha'].dt.hour
+    df['dia_semana'] = df['fecha'].dt.day_name()
+    df['mes'] = df['fecha'].dt.month_name()
+    return df
 
-#  ==========================================================
+# ==========================================================
 # CONFIGURACIÓN INICIAL
 # ==========================================================
 st.set_page_config(
@@ -199,7 +176,7 @@ st.markdown("""
         background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
         border-left: 5px solid #ff6b6b;
     }
-        .section-header {
+    .section-header {
         font-size: 1.8rem;
         color: #2c3e50;
         margin: 2rem 0 1rem 0;
@@ -224,7 +201,7 @@ st.markdown("""
         font-weight: 600;
         transition: all 0.3s ease;
     }
-        .stButton button:hover {
+    .stButton button:hover {
         transform: translateY(-2px);
         box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
     }
@@ -296,7 +273,6 @@ file_type = st.radio(
 )
 
 uploaded_file = None
-log_format = None
 
 if file_type == "JSON":
     uploaded_file = st.file_uploader(
@@ -393,12 +369,7 @@ if uploaded_file:
     # PREPROCESAMIENTO
     # ==========================================================
     with st.spinner('🔄 Procesando datos y generando visualizaciones...'):
-        df_processed = preprocess_data(df.copy(), file_type, log_format)
-
-    # Verificar que tenemos datos después del preprocesamiento
-    if df_processed is None or len(df_processed) == 0:
-        st.error("❌ No hay datos válidos después del preprocesamiento. Verifica el formato de tu archivo.")
-        st.stop()
+        df_processed = preprocess_data(df.copy())
 
     st.success(f"✅ **{len(df_processed):,} registros** procesados correctamente")
 
@@ -409,68 +380,26 @@ if uploaded_file:
 
     # Cálculo de métricas
     features = df_processed.groupby('IP').agg({
-            'fecha': 'count',
-            'url': 'nunique',
-            'hora': 'nunique'
-        }).rename(columns={'fecha': 'total_requests', 'url': 'unique_pages', 'hora': 'unique_hours'})
+        'fecha': 'count',
+        'url': 'nunique',
+        'hora': 'nunique'
+    }).rename(columns={'fecha': 'total_requests', 'url': 'unique_pages', 'hora': 'unique_hours'})
+
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features)
     iso_forest = IsolationForest(contamination=contamination_rate, random_state=42, n_estimators=100)
     anomalies = iso_forest.fit_predict(features_scaled)
     features['es_anomalia'] = np.where(anomalies == -1, 1, 0)
 
-    # Calcular métricas con valores por defecto
-    usuarios_unicos = df_processed['IP'].nunique()
-    total_requests = len(df_processed)
-    
-    # Manejar el caso donde no hay datos de dispositivo
-    try:
-        porcentaje_movil = (df_processed['dispositivo'] == 'Móvil').mean() * 100
-    except:
-        porcentaje_movil = 0
-    
-    try:
-        navegador_principal = df_processed['navegador'].mode()[0] if len(df_processed['navegador'].mode()) > 0 else 'N/A'
-    except:
-        navegador_principal = 'N/A'
-        
-    try:
-        pais_predominante = df_processed['pais'].mode()[0] if len(df_processed['pais'].mode()) > 0 else 'N/A'
-    except:
-        pais_predominante = 'N/A'
-        
-    try:
-        porcentaje_anomalias = features['es_anomalia'].mean() * 100
-    except:
-        porcentaje_anomalias = 0
-        
-    try:
-        ips_sospechosas = len(features[features['es_anomalia'] == 1])
-    except:
-        ips_sospechosas = 0
-
     metricas = {
-        'Usuarios únicos': usuarios_unicos,
-        'Total de requests': total_requests,
-        '% Móvil': porcentaje_movil,
-        'Navegador principal': navegador_principal,
-        'País predominante': pais_predominante,
-        '% Anomalías': porcentaje_anomalias,
-        'IPs sospechosas': ips_sospechosas
+        'Usuarios únicos': df_processed['IP'].nunique(),
+        'Total de requests': len(df_processed),
+        '% Móvil': (df_processed['dispositivo'] == 'Móvil').mean() * 100,
+        'Navegador principal': df_processed['navegador'].mode()[0] if len(df_processed['navegador'].mode()) > 0 else 'N/A',
+        'País predominante': df_processed['pais'].mode()[0] if len(df_processed['pais'].mode()) > 0 else 'N/A',
+        '% Anomalías': features['es_anomalia'].mean() * 100,
+        'IPs sospechosas': len(features[features['es_anomalia'] == 1])
     }
-    
-except Exception as e:
-    st.error(f"Error calculando métricas: {str(e)}")
-        # Métricas por defecto en caso de error
-    metricas = {
-            'Usuarios únicos': 0,
-            'Total de requests': 0,
-            '% Móvil': 0,
-            'Navegador principal': 'N/A',
-            'País predominante': 'N/A',
-            '% Anomalías': 0,
-            'IPs sospechosas': 0
-}
 
     # Mostrar métricas en columnas
     col1, col2, col3, col4 = st.columns(4)
