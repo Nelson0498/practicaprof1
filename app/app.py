@@ -115,29 +115,51 @@ def geolocate_ip(ip):
         '200.1': 'Brasil',
         '186.': 'Colombia',
         '200.32': 'Uruguay',
-        '200.3': 'Paraguay'
+        '200.3': 'Paraguay',
+        '192.168.': 'Red Local',
+        '203.0.113.': 'Ejemplo',
+        '198.51.100.': 'Ejemplo'
     }
     for prefix, country in ip_ranges.items():
         if ip.startswith(prefix):
             return country
     return 'Otros Países'
 
-def preprocess_data(df):
-    df['fecha'] = pd.to_datetime(df['fecha'], format='%d-%m-%Y %I:%M:%S%p', errors='coerce')
-    # Si falla el formato anterior, intentar con formato de log estándar
-    if df['fecha'].isna().any():
-        df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
-    
-    df['navegador'] = df['user_agent'].apply(extract_browser)
-    df['sistema_operativo'] = df['user_agent'].apply(extract_os)
-    df['dispositivo'] = df['user_agent'].apply(extract_device)
-    static_extensions = ['.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.ico', '.svg', '.woff', '.ttf']
-    df['es_estatico'] = df['url'].str.contains('|'.join(static_extensions), case=False, na=False)
-    df['pais'] = df['IP'].apply(geolocate_ip)
-    df['hora'] = df['fecha'].dt.hour
-    df['dia_semana'] = df['fecha'].dt.day_name()
-    df['mes'] = df['fecha'].dt.month_name()
-    return df
+def preprocess_data(df, file_type, log_format):
+    """Preprocesa los datos según el tipo de archivo y formato"""
+    try:
+        if file_type == "JSON":
+            # Formato original para JSON
+            df['fecha'] = pd.to_datetime(df['fecha'], format='%d-%m-%Y %I:%M:%S%p', errors='coerce')
+        elif log_format == "Log Apache/NGINX":
+            # Formato para logs Apache
+            df['fecha'] = pd.to_datetime(df['fecha'], format='%d/%b/%Y:%H:%M:%S %z', errors='coerce')
+        else:
+            # Intentar formato genérico
+            df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
+        
+        # Eliminar filas con fechas inválidas
+        initial_count = len(df)
+        df = df.dropna(subset=['fecha'])
+        if len(df) < initial_count:
+            st.warning(f"Se eliminaron {initial_count - len(df)} registros con fechas inválidas")
+        
+        # Resto del procesamiento
+        df['navegador'] = df['user_agent'].apply(extract_browser)
+        df['sistema_operativo'] = df['user_agent'].apply(extract_os)
+        df['dispositivo'] = df['user_agent'].apply(extract_device)
+        static_extensions = ['.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.ico', '.svg', '.woff', '.ttf']
+        df['es_estatico'] = df['url'].str.contains('|'.join(static_extensions), case=False, na=False)
+        df['pais'] = df['IP'].apply(geolocate_ip)
+        df['hora'] = df['fecha'].dt.hour
+        df['dia_semana'] = df['fecha'].dt.day_name()
+        df['mes'] = df['fecha'].dt.month_name()
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error en preprocesamiento: {str(e)}")
+        return df
 
 # ==========================================================
 # CONFIGURACIÓN INICIAL
@@ -273,6 +295,7 @@ file_type = st.radio(
 )
 
 uploaded_file = None
+log_format = None
 
 if file_type == "JSON":
     uploaded_file = st.file_uploader(
@@ -369,7 +392,12 @@ if uploaded_file:
     # PREPROCESAMIENTO
     # ==========================================================
     with st.spinner('🔄 Procesando datos y generando visualizaciones...'):
-        df_processed = preprocess_data(df.copy())
+        df_processed = preprocess_data(df.copy(), file_type, log_format)
+
+    # Verificar que tenemos datos después del preprocesamiento
+    if df_processed is None or len(df_processed) == 0:
+        st.error("❌ No hay datos válidos después del preprocesamiento. Verifica el formato de tu archivo.")
+        st.stop()
 
     st.success(f"✅ **{len(df_processed):,} registros** procesados correctamente")
 
@@ -378,28 +406,72 @@ if uploaded_file:
     # ==========================================================
     st.markdown("### 📊 Métricas Principales en Tiempo Real")
 
-    # Cálculo de métricas
-    features = df_processed.groupby('IP').agg({
-        'fecha': 'count',
-        'url': 'nunique',
-        'hora': 'nunique'
-    }).rename(columns={'fecha': 'total_requests', 'url': 'unique_pages', 'hora': 'unique_hours'})
+    # Cálculo de métricas con manejo de errores
+    try:
+        features = df_processed.groupby('IP').agg({
+            'fecha': 'count',
+            'url': 'nunique',
+            'hora': 'nunique'
+        }).rename(columns={'fecha': 'total_requests', 'url': 'unique_pages', 'hora': 'unique_hours'})
 
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-    iso_forest = IsolationForest(contamination=contamination_rate, random_state=42, n_estimators=100)
-    anomalies = iso_forest.fit_predict(features_scaled)
-    features['es_anomalia'] = np.where(anomalies == -1, 1, 0)
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+        iso_forest = IsolationForest(contamination=contamination_rate, random_state=42, n_estimators=100)
+        anomalies = iso_forest.fit_predict(features_scaled)
+        features['es_anomalia'] = np.where(anomalies == -1, 1, 0)
 
-    metricas = {
-        'Usuarios únicos': df_processed['IP'].nunique(),
-        'Total de requests': len(df_processed),
-        '% Móvil': (df_processed['dispositivo'] == 'Móvil').mean() * 100,
-        'Navegador principal': df_processed['navegador'].mode()[0] if len(df_processed['navegador'].mode()) > 0 else 'N/A',
-        'País predominante': df_processed['pais'].mode()[0] if len(df_processed['pais'].mode()) > 0 else 'N/A',
-        '% Anomalías': features['es_anomalia'].mean() * 100,
-        'IPs sospechosas': len(features[features['es_anomalia'] == 1])
-    }
+        # Calcular métricas con valores por defecto
+        usuarios_unicos = df_processed['IP'].nunique()
+        total_requests = len(df_processed)
+        
+        # Manejar el caso donde no hay datos de dispositivo
+        try:
+            porcentaje_movil = (df_processed['dispositivo'] == 'Móvil').mean() * 100
+        except:
+            porcentaje_movil = 0
+        
+        try:
+            navegador_principal = df_processed['navegador'].mode()[0] if len(df_processed['navegador'].mode()) > 0 else 'N/A'
+        except:
+            navegador_principal = 'N/A'
+            
+        try:
+            pais_predominante = df_processed['pais'].mode()[0] if len(df_processed['pais'].mode()) > 0 else 'N/A'
+        except:
+            pais_predominante = 'N/A'
+            
+        try:
+            porcentaje_anomalias = features['es_anomalia'].mean() * 100
+        except:
+            porcentaje_anomalias = 0
+            
+        try:
+            ips_sospechosas = len(features[features['es_anomalia'] == 1])
+        except:
+            ips_sospechosas = 0
+
+        metricas = {
+            'Usuarios únicos': usuarios_unicos,
+            'Total de requests': total_requests,
+            '% Móvil': porcentaje_movil,
+            'Navegador principal': navegador_principal,
+            'País predominante': pais_predominante,
+            '% Anomalías': porcentaje_anomalias,
+            'IPs sospechosas': ips_sospechosas
+        }
+
+    except Exception as e:
+        st.error(f"Error calculando métricas: {str(e)}")
+        # Métricas por defecto en caso de error
+        metricas = {
+            'Usuarios únicos': 0,
+            'Total de requests': 0,
+            '% Móvil': 0,
+            'Navegador principal': 'N/A',
+            'País predominante': 'N/A',
+            '% Anomalías': 0,
+            'IPs sospechosas': 0
+        }
 
     # Mostrar métricas en columnas
     col1, col2, col3, col4 = st.columns(4)
@@ -451,184 +523,195 @@ if uploaded_file:
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        
         st.markdown("#### 📊 Tráfico por Hora del Día")
         
-        # Tráfico por hora
-        trafico_por_hora = df_processed.groupby('hora').size().reset_index(name='count')
-        
-        fig_hora = px.area(
-            trafico_por_hora, 
-            x='hora', 
-            y='count',
-            labels={'hora': 'Hora del Día', 'count': 'Número de Requests'},
-            color_discrete_sequence=['#667eea']
-        )
-        
-        fig_hora.update_layout(
-            hovermode='x unified',
-            showlegend=False,
-            height=400,
-            xaxis=dict(tickmode='linear', dtick=1),
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-        )
-        
-        fig_hora.update_traces(
-            hovertemplate="<b>Hora %{x}:00</b><br>%{y:,} requests<extra></extra>",
-            fill='tozeroy'
-        )
-        
-        st.plotly_chart(fig_hora, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        # Tráfico por hora con manejo de errores
+        try:
+            trafico_por_hora = df_processed.groupby('hora').size().reset_index(name='count')
+            
+            fig_hora = px.area(
+                trafico_por_hora, 
+                x='hora', 
+                y='count',
+                labels={'hora': 'Hora del Día', 'count': 'Número de Requests'},
+                color_discrete_sequence=['#667eea']
+            )
+            
+            fig_hora.update_layout(
+                hovermode='x unified',
+                showlegend=False,
+                height=400,
+                xaxis=dict(tickmode='linear', dtick=1),
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+            )
+            
+            fig_hora.update_traces(
+                hovertemplate="<b>Hora %{x}:00</b><br>%{y:,} requests<extra></extra>",
+                fill='tozeroy'
+            )
+            
+            st.plotly_chart(fig_hora, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando gráfico de tráfico por hora: {str(e)}")
+            st.info("No se pudieron generar los datos para el gráfico de tráfico por hora")
 
     with col2:
-        
         st.markdown("#### 🌍 Distribución Geográfica")
         
-        # Distribución por países
-        pais_distribution = df_processed['pais'].value_counts().reset_index()
-        pais_distribution.columns = ['pais', 'count']
-        
-        fig_pie = px.pie(
-            pais_distribution,
-            values='count',
-            names='pais',
-            hole=0.4,
-            color_discrete_sequence=[
-                "#0d6efd",  # azul intenso
-                "#3d8bfd",  # azul fuerte
-                "#6ea8fe",  # azul medio
-                "#9ec5fe",  # azul claro
-                "#cfe2ff",  # azul muy claro
-            ]
-        )
-        
-        fig_pie.update_layout(
-            height=400,
-            showlegend=True,
-            legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.1)
-        )
-        
-        fig_pie.update_traces(
-            hovertemplate="<b>%{label}</b><br>%{value:,} requests (%{percent})<extra></extra>",
-            textposition='inside',
-            textinfo='percent+label'
-        )
-        
-        st.plotly_chart(fig_pie, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        try:
+            # Distribución por países
+            pais_distribution = df_processed['pais'].value_counts().reset_index()
+            pais_distribution.columns = ['pais', 'count']
+            
+            fig_pie = px.pie(
+                pais_distribution,
+                values='count',
+                names='pais',
+                hole=0.4,
+                color_discrete_sequence=[
+                    "#0d6efd",  # azul intenso
+                    "#3d8bfd",  # azul fuerte
+                    "#6ea8fe",  # azul medio
+                    "#9ec5fe",  # azul claro
+                    "#cfe2ff",  # azul muy claro
+                ]
+            )
+            
+            fig_pie.update_layout(
+                height=400,
+                showlegend=True,
+                legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.1)
+            )
+            
+            fig_pie.update_traces(
+                hovertemplate="<b>%{label}</b><br>%{value:,} requests (%{percent})<extra></extra>",
+                textposition='inside',
+                textinfo='percent+label'
+            )
+            
+            st.plotly_chart(fig_pie, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando gráfico de distribución geográfica: {str(e)}")
+            st.info("No se pudieron generar los datos para el gráfico de distribución geográfica")
 
     # Fila 2: Dispositivos y Navegadores
     col3, col4 = st.columns(2)
 
     with col3:
-        
         st.markdown("#### 📱 Distribución por Dispositivo")
         
-        dispositivo_data = df_processed['dispositivo'].value_counts().reset_index()
-        dispositivo_data.columns = ['dispositivo', 'count']
-        
-        fig_dev = px.bar(
-            dispositivo_data,
-            x='dispositivo',
-            y='count',
-            color='dispositivo',
-            color_discrete_sequence=['#667eea', '#764ba2'],
-            text='count'
-        )
-        
-        fig_dev.update_layout(
-            height=400,
-            showlegend=False,
-            xaxis_title="",
-            yaxis_title="Cantidad de Requests",
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-        )
-        
-        fig_dev.update_traces(
-            hovertemplate="<b>%{x}</b><br>%{y:,} requests<extra></extra>",
-            texttemplate='%{y:,}',
-            textposition='outside'
-        )
-        
-        st.plotly_chart(fig_dev, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        try:
+            dispositivo_data = df_processed['dispositivo'].value_counts().reset_index()
+            dispositivo_data.columns = ['dispositivo', 'count']
+            
+            fig_dev = px.bar(
+                dispositivo_data,
+                x='dispositivo',
+                y='count',
+                color='dispositivo',
+                color_discrete_sequence=['#667eea', '#764ba2'],
+                text='count'
+            )
+            
+            fig_dev.update_layout(
+                height=400,
+                showlegend=False,
+                xaxis_title="",
+                yaxis_title="Cantidad de Requests",
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+            )
+            
+            fig_dev.update_traces(
+                hovertemplate="<b>%{x}</b><br>%{y:,} requests<extra></extra>",
+                texttemplate='%{y:,}',
+                textposition='outside'
+            )
+            
+            st.plotly_chart(fig_dev, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando gráfico de dispositivos: {str(e)}")
+            st.info("No se pudieron generar los datos para el gráfico de dispositivos")
 
     with col4:
-        
         st.markdown("#### 🌐 Navegadores Más Utilizados")
         
-        navegador_data = df_processed['navegador'].value_counts().reset_index()
-        navegador_data.columns = ['navegador', 'count']
-        
-        fig_nav = px.pie(
-            navegador_data,
-            values='count',
-            names='navegador',
-            color_discrete_sequence=[
-                "#0d6efd",  # azul intenso
-                "#3d8bfd",  # azul fuerte
-                "#6ea8fe",  # azul medio
-                "#9ec5fe",  # azul claro
-                "#cfe2ff",  # azul muy claro
-            ]
-        )
-        
-        fig_nav.update_layout(
-            height=400,
-            showlegend=True
-        )
-        
-        fig_nav.update_traces(
-            hovertemplate="<b>%{label}</b><br>%{value:,} requests (%{percent})<extra></extra>",
-            textposition='inside',
-            textinfo='percent+label'
-        )
-        
-        st.plotly_chart(fig_nav, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        try:
+            navegador_data = df_processed['navegador'].value_counts().reset_index()
+            navegador_data.columns = ['navegador', 'count']
+            
+            fig_nav = px.pie(
+                navegador_data,
+                values='count',
+                names='navegador',
+                color_discrete_sequence=[
+                    "#0d6efd",  # azul intenso
+                    "#3d8bfd",  # azul fuerte
+                    "#6ea8fe",  # azul medio
+                    "#9ec5fe",  # azul claro
+                    "#cfe2ff",  # azul muy claro
+                ]
+            )
+            
+            fig_nav.update_layout(
+                height=400,
+                showlegend=True
+            )
+            
+            fig_nav.update_traces(
+                hovertemplate="<b>%{label}</b><br>%{value:,} requests (%{percent})<extra></extra>",
+                textposition='inside',
+                textinfo='percent+label'
+            )
+            
+            st.plotly_chart(fig_nav, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando gráfico de navegadores: {str(e)}")
+            st.info("No se pudieron generar los datos para el gráfico de navegadores")
 
     # Fila 3: Páginas más visitadas
     
     st.markdown("#### 🔥 Top 10 Páginas Más Visitadas")
     
-    paginas_populares = df_processed[~df_processed['es_estatico']]['url'].value_counts().head(10).reset_index()
-    paginas_populares.columns = ['url', 'visitas']
-    
-    # Acortar URLs largas para mejor visualización
-    paginas_populares['url_corto'] = paginas_populares['url'].apply(
-        lambda x: x[:40] + '...' if len(x) > 40 else x
-    )
-    
-    fig_paginas = px.bar(
-        paginas_populares,
-        y='url_corto',
-        x='visitas',
-        orientation='h',
-        color='visitas',
-        color_continuous_scale='RdBu_r',
-        text='visitas'
-    )
-    
-    fig_paginas.update_layout(
-        height=500,
-        xaxis_title="Número de Visitas",
-        yaxis_title="",
-        yaxis={'categoryorder':'total ascending'},
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-    )
-    
-    fig_paginas.update_traces(
-        hovertemplate="<b>%{y}</b><br>%{x:,} visitas<extra></extra>",
-        texttemplate='%{x:,}',
-        textposition='outside'
-    )
-    
-    st.plotly_chart(fig_paginas, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    try:
+        paginas_populares = df_processed[~df_processed['es_estatico']]['url'].value_counts().head(10).reset_index()
+        paginas_populares.columns = ['url', 'visitas']
+        
+        # Acortar URLs largas para mejor visualización
+        paginas_populares['url_corto'] = paginas_populares['url'].apply(
+            lambda x: x[:40] + '...' if len(x) > 40 else x
+        )
+        
+        fig_paginas = px.bar(
+            paginas_populares,
+            y='url_corto',
+            x='visitas',
+            orientation='h',
+            color='visitas',
+            color_continuous_scale='RdBu_r',
+            text='visitas'
+        )
+        
+        fig_paginas.update_layout(
+            height=500,
+            xaxis_title="Número de Visitas",
+            yaxis_title="",
+            yaxis={'categoryorder':'total ascending'},
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+        )
+        
+        fig_paginas.update_traces(
+            hovertemplate="<b>%{y}</b><br>%{x:,} visitas<extra></extra>",
+            texttemplate='%{x:,}',
+            textposition='outside'
+        )
+        
+        st.plotly_chart(fig_paginas, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error generando gráfico de páginas más visitadas: {str(e)}")
+        st.info("No se pudieron generar los datos para el gráfico de páginas más visitadas")
 
     # ==========================================================
     # ANÁLISIS AVANZADO INTERACTIVO
@@ -639,87 +722,121 @@ if uploaded_file:
     col5, col6 = st.columns(2)
 
     with col5:
-        
         st.markdown("#### 🚨 Detección de Anomalías y Bots")
         
-        # Preparar datos para el scatter plot
-        scatter_data = features.reset_index()
-        
-        fig_anomalies = px.scatter(
-            scatter_data,
-            x='total_requests',
-            y='unique_pages',
-            color='es_anomalia',
-            color_discrete_map={0: '#2ecc71', 1: '#e74c3c'},
-            size='unique_hours',
-            hover_data=['IP'],
-            labels={
-                'total_requests': 'Total de Requests por IP',
-                'unique_pages': 'Páginas Únicas Visitadas',
-                'es_anomalia': 'Es Anomalía'
-            },
-        )
-        
-        fig_anomalies.update_layout(
-            height=500,
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1
+        try:
+             # AGREGAR ESTA REFERENCIA DE COLORES:
+            st.markdown("""
+            <div style='background: #f8f9fa; padding: 0.75rem; border-radius: 8px; border-left: 4px solid #cccc; margin-bottom: 1rem;'>
+                <div style='display: flex; gap: 1rem; font-size: 0.8rem; justify-content: center;'>
+                    <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                        <div style='width: 12px; height: 12px; background: #B0DAF7; border-radius: 50%;'></div>
+                        <span>Comportamiento Normal</span>
+                    </div>
+                    <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                        <div style='width: 12px; height: 12px; background: #095E99; border-radius: 50%;'></div>
+                        <span>Anomalía Detectada</span>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            # Preparar datos para el scatter plot
+            scatter_data = features.reset_index()
+            
+            fig_anomalies = px.scatter(
+                scatter_data,
+                x='total_requests',
+                y='unique_pages',
+                color='es_anomalia',
+                color_discrete_map={0: '#2ecc71', 1: '#e74c3c'},
+                size='unique_hours',
+                hover_data=['IP'],
+                labels={
+                    'total_requests': 'Total de Requests por IP',
+                    'unique_pages': 'Páginas Únicas Visitadas',
+                    'es_anomalia': 'Es Anomalía'
+                },
             )
-        )
-        
-        fig_anomalies.update_traces(
-            hovertemplate="<b>IP: %{customdata[0]}</b><br>Requests: %{x}<br>Páginas únicas: %{y}<extra></extra>",
-            marker=dict(opacity=0.7, line=dict(width=1, color='DarkSlateGrey'))
-        )
-        
-        st.plotly_chart(fig_anomalies, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+            
+            fig_anomalies.update_layout(
+                height=500,
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1
+                )
+            )
+            
+            fig_anomalies.update_traces(
+                hovertemplate="<b>IP: %{customdata[0]}</b><br>Requests: %{x}<br>Páginas únicas: %{y}<extra></extra>",
+                marker=dict(opacity=0.7, line=dict(width=1, color='DarkSlateGrey'))
+            )
+            
+            st.plotly_chart(fig_anomalies, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando gráfico de anomalías: {str(e)}")
+            st.info("No se pudieron generar los datos para el gráfico de detección de anomalías")
 
     with col6:
-
         st.markdown("#### 👥 Segmentación de Usuarios por Comportamiento")
         
-        # K-Means Clustering
-        cluster_features = features[['total_requests', 'unique_pages', 'unique_hours']].dropna()
-        cluster_scaled = scaler.fit_transform(cluster_features)
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        cluster_features = cluster_features.copy()
-        cluster_features['cluster'] = kmeans.fit_predict(cluster_scaled)
-        
-        fig_clusters = px.scatter(
-            cluster_features.reset_index(),
-            x='total_requests',
-            y='unique_pages',
-            color='cluster',
-            color_continuous_scale='RdBu_r',
-            size='unique_hours',
-            hover_data=['IP'],
-            labels={
-                'total_requests': 'Total de Requests por IP',
-                'unique_pages': 'Páginas Únicas Visitadas',
-                'cluster': 'Grupo'
-            },
-        )
-        
-        fig_clusters.update_layout(
-            height=500,
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-        )
-        
-        fig_clusters.update_traces(
-            hovertemplate="<b>IP: %{customdata[0]}</b><br>Requests: %{x}<br>Páginas únicas: %{y}<br>Grupo: %{marker.color}<extra></extra>",
-            marker=dict(opacity=0.7, line=dict(width=1, color='DarkSlateGrey'))
-        )
-        
-        st.plotly_chart(fig_clusters, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        try:
+            # AGREGAR ESTA REFERENCIA DE COLORES:
+            st.markdown("""
+            <div style='background: #f8f9fa; padding: 0.75rem; border-radius: 8px; border-left: 4px solid #cccc; margin-bottom: 1rem;'>
+                <div style='display: flex; gap: 1rem; font-size: 0.8rem; justify-content: center;'>
+                    <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                        <div style='width: 12px; height: 12px; background: #095E99; border-radius: 50%;'></div>
+                        <span>Comportamiento Normal</span>
+                    </div>
+                    <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                        <div style='width: 12px; height: 12px; background: #590D0D; border-radius: 50%;'></div>
+                        <span>Anomalía Detectada</span>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            # K-Means Clustering
+            cluster_features = features[['total_requests', 'unique_pages', 'unique_hours']].dropna()
+            cluster_scaled = scaler.fit_transform(cluster_features)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+            cluster_features = cluster_features.copy()
+            cluster_features['cluster'] = kmeans.fit_predict(cluster_scaled)
+            
+            fig_clusters = px.scatter(
+                cluster_features.reset_index(),
+                x='total_requests',
+                y='unique_pages',
+                color='cluster',
+                color_continuous_scale='RdBu_r',
+                size='unique_hours',
+                hover_data=['IP'],
+                labels={
+                    'total_requests': 'Total de Requests por IP',
+                    'unique_pages': 'Páginas Únicas Visitadas',
+                    'cluster': 'Grupo'
+                },
+            )
+            
+            fig_clusters.update_layout(
+                height=500,
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+            )
+            
+            fig_clusters.update_traces(
+                hovertemplate="<b>IP: %{customdata[0]}</b><br>Requests: %{x}<br>Páginas únicas: %{y}<br>Grupo: %{marker.color}<extra></extra>",
+                marker=dict(opacity=0.7, line=dict(width=1, color='DarkSlateGrey'))
+            )
+            
+            st.plotly_chart(fig_clusters, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando gráfico de segmentación: {str(e)}")
+            st.info("No se pudieron generar los datos para el gráfico de segmentación de usuarios")
 
     # ==========================================================
     # ANÁLISIS TEMPORAL AVANZADO
@@ -730,68 +847,102 @@ if uploaded_file:
     col7, col8 = st.columns(2)
 
     with col7:
-        
+        # AGREGAR ESTA REFERENCIA DE COLORES:
         st.markdown("#### 📅 Tráfico por Día de la Semana")
+        st.markdown("""
+        <div style='background: #f8f9fa; padding: 0.75rem; border-radius: 8px; border-left: 4px solid #cccc; margin-bottom: 1rem;'>
+            <div style='display: flex; gap: 1rem; font-size: 0.8rem; justify-content: center;'>
+                <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                    <div style='width: 12px; height: 12px; background: #B0DAF7; border-radius: 50%;'></div>
+                    <span>Comportamiento Normal</span>
+                </div>
+                <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                    <div style='width: 12px; height: 12px; background: #095E99; border-radius: 50%;'></div>
+                    <span>Anomalía Detectada</span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        dia_orden = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        dia_es = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
-        
-        trafico_dia = df_processed['dia_semana'].value_counts().reindex(dia_orden)
-        trafico_dia.index = dia_es
-        
-        fig_dia = px.bar(
-            x=trafico_dia.index,
-            y=trafico_dia.values,
-            color=trafico_dia.values,
-            color_continuous_scale='blues',
-            text=trafico_dia.values
-        )
-        
-        fig_dia.update_layout(
-            height=400,
-            xaxis_title="Día de la Semana",
-            yaxis_title="Número de Requests",
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            showlegend=False
-        )
-        
-        fig_dia.update_traces(
-            hovertemplate="<b>%{x}</b><br>%{y:,} requests<extra></extra>",
-            texttemplate='%{y:,}',
-            textposition='outside'
-        )
-        
-        st.plotly_chart(fig_dia, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        try:
+            dia_orden = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            dia_es = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+            
+            trafico_dia = df_processed['dia_semana'].value_counts().reindex(dia_orden)
+            trafico_dia.index = dia_es
+            
+            fig_dia = px.bar(
+                x=trafico_dia.index,
+                y=trafico_dia.values,
+                color=trafico_dia.values,
+                color_continuous_scale='blues',
+                text=trafico_dia.values
+            )
+            
+            fig_dia.update_layout(
+                height=400,
+                xaxis_title="Día de la Semana",
+                yaxis_title="Número de Requests",
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                showlegend=False
+            )
+            
+            fig_dia.update_traces(
+                hovertemplate="<b>%{x}</b><br>%{y:,} requests<extra></extra>",
+                texttemplate='%{y:,}',
+                textposition='outside'
+            )
+            
+            st.plotly_chart(fig_dia, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando gráfico de días de la semana: {str(e)}")
+            st.info("No se pudieron generar los datos para el gráfico de días de la semana")
 
     with col8:
-        
         st.markdown("#### 🌙 Patrón de Actividad por Hora")
         
-        # Heatmap de actividad por hora y dispositivo
-        heatmap_data = df_processed.groupby(['hora', 'dispositivo']).size().unstack(fill_value=0)
-        
-        fig_heat = px.imshow(
-            heatmap_data.T,
-            labels=dict(x="Hora del Día", y="Dispositivo", color="Requests"),
-            color_continuous_scale="Blues",
-            aspect="auto"
-        )
-        
-        fig_heat.update_layout(
-            height=400,
-            xaxis=dict(tickmode='linear', dtick=1),
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-        )
-        
-        fig_heat.update_traces(
-            hovertemplate="<b>Hora %{x}:00</b><br>Dispositivo: %{y}<br>Requests: %{z:,}<extra></extra>"
-        )
-        
-        st.plotly_chart(fig_heat, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        try:
+            # AGREGAR ESTA REFERENCIA DE COLORES:
+            st.markdown("""
+            <div style='background: #f8f9fa; padding: 0.75rem; border-radius: 8px; border-left: 4px solid #cccc; margin-bottom: 1rem;'>
+                <div style='display: flex; gap: 1rem; font-size: 0.8rem; justify-content: center;'>
+                    <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                        <div style='width: 12px; height: 12px; background: #B0DAF7; border-radius: 50%;'></div>
+                        <span>Comportamiento Normal</span>
+                    </div>
+                    <div style='display: flex; align-items: center; gap: 0.3rem;'>
+                        <div style='width: 12px; height: 12px; background: #095E99; border-radius: 50%;'></div>
+                        <span>Anomalía Detectada</span>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            # Heatmap de actividad por hora y dispositivo
+            heatmap_data = df_processed.groupby(['hora', 'dispositivo']).size().unstack(fill_value=0)
+            
+            fig_heat = px.imshow(
+                heatmap_data.T,
+                labels=dict(x="Hora del Día", y="Dispositivo", color="Requests"),
+                color_continuous_scale="Blues",
+                aspect="auto"
+            )
+            
+            fig_heat.update_layout(
+                height=400,
+                xaxis=dict(tickmode='linear', dtick=1),
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+            )
+            
+            fig_heat.update_traces(
+                hovertemplate="<b>Hora %{x}:00</b><br>Dispositivo: %{y}<br>Requests: %{z:,}<extra></extra>"
+            )
+            
+            st.plotly_chart(fig_heat, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generando heatmap de actividad: {str(e)}")
+            st.info("No se pudieron generar los datos para el heatmap de actividad")
 
     # ==========================================================
     # PANEL DE CONTROL Y DESCARGAS
@@ -807,16 +958,21 @@ if uploaded_file:
         col9, col10 = st.columns(2)
         
         with col9:
-            hora_pico = trafico_por_hora.loc[trafico_por_hora['count'].idxmax(), 'hora']
+            # Manejar el caso cuando no hay datos de tráfico por hora
+            try:
+                hora_pico = trafico_por_hora.loc[trafico_por_hora['count'].idxmax(), 'hora']
+            except:
+                hora_pico = "N/A"
+                
             st.markdown(f"""
             <div style='background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); padding: 1.5rem; border-radius: 10px;'>
             <h4 style='color: #1976d2; margin-top: 0;'>📈 Métricas de Tráfico</h4>
             <ul style='color: #37474f;'>
-                <li><strong>Período analizado:</strong> {df_processed['fecha'].min().strftime('%d/%m/%Y')} - {df_processed['fecha'].max().strftime('%d/%m/%Y')}</li>
+                <li><strong>Período analizado:</strong> {df_processed['fecha'].min().strftime('%d/%m/%Y') if len(df_processed) > 0 else 'N/A'} - {df_processed['fecha'].max().strftime('%d/%m/%Y') if len(df_processed) > 0 else 'N/A'}</li>
                 <li><strong>Usuarios únicos:</strong> {metricas['Usuarios únicos']:,}</li>
                 <li><strong>Total de requests:</strong> {metricas['Total de requests']:,}</li>
                 <li><strong>Tráfico móvil:</strong> {metricas['% Móvil']:.1f}%</li>
-                <li><strong>Hora pico:</strong> {hora_pico}:00 hs</li>
+                <li><strong>Hora pico:</strong> {hora_pico if hora_pico != 'N/A' else 'N/A'}:00 hs</li>
             </ul>
             </div>
             """, unsafe_allow_html=True)
@@ -838,7 +994,11 @@ if uploaded_file:
     with tab2:
         st.markdown("### 🔧 Recomendaciones Estratégicas")
         
-        hora_pico = trafico_por_hora.loc[trafico_por_hora['count'].idxmax(), 'hora']
+        try:
+            hora_pico = trafico_por_hora.loc[trafico_por_hora['count'].idxmax(), 'hora']
+        except:
+            hora_pico = 12  # Valor por defecto
+            
         recommendations = [
             {
                 "icon": "🚀",
@@ -868,13 +1028,14 @@ if uploaded_file:
         
         for rec in recommendations:
             with st.container():
-                col11, col12 = st.columns([1, 10])
-                with col11:
-                    st.markdown(f"<div style='font-size: 2rem;'>{rec['icon']}</div>", unsafe_allow_html=True)
+                col12,col11 = st.columns([12,1])
+                # with col11:
+                    # st.markdown(f"<div style='font-size: 2rem;'>{rec['icon']}</div>", unsafe_allow_html=True)
                 with col12:
                     st.markdown(f"""
+                              
                     <div style='padding: 1rem; background: {"#ffebee" if rec['priority'] == 'Alta' else "#fff8e1" if rec['priority'] == 'Media' else "#e8f5e8"}; border-radius: 8px; margin-bottom: 1rem;'>
-                        <h4 style='margin: 0; color: #2c3e50;'>{rec['title']}</h4>
+                        <h4 style='margin: 0; color: #2c3e50;'>{rec['icon']}{rec['title']}</h4>
                         <p style='margin: 0.5rem 0 0 0; color: #546e7a;'>{rec['description']}</p>
                         <span style='background: {"#e53935" if rec['priority'] == 'Alta' else "#ffb300" if rec['priority'] == 'Media' else "#43a047"}; color: white; padding: 0.2rem 0.8rem; border-radius: 12px; font-size: 0.8rem;'>Prioridad: {rec['priority']}</span>
                     </div>
